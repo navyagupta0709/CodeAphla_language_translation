@@ -1,5 +1,6 @@
 import streamlit as st
-from googletrans import Translator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
+from langdetect import detect as detect_language
 from gtts import gTTS
 import base64
 import io
@@ -141,6 +142,18 @@ html, body, [class*="css"] {
     margin-top: 0.8rem;
 }
 
+/* Engine Tag */
+.engine-tag {
+    display: inline-block;
+    background: rgba(148, 163, 184, 0.1);
+    color: #94a3b8;
+    border-radius: 6px;
+    padding: 0.1rem 0.5rem;
+    font-size: 0.68rem;
+    font-weight: 500;
+    margin-left: 0.4rem;
+}
+
 /* Footer */
 .footer {
     text-align: center;
@@ -160,7 +173,7 @@ LANGUAGES = {
     "French": "fr",
     "Spanish": "es",
     "German": "de",
-    "Chinese (Simplified)": "zh-cn",
+    "Chinese (Simplified)": "zh-CN",
     "Arabic": "ar",
     "Japanese": "ja",
     "Korean": "ko",
@@ -186,9 +199,75 @@ LANGUAGES = {
     "Norwegian": "no",
 }
 
-LANG_NAMES = {v: k for k, v in LANGUAGES.items()}
+LANG_NAMES = {v.lower(): k for k, v in LANGUAGES.items()}
 
-translator = Translator()
+
+def get_lang_name(code):
+    """Map a language code back to its display name, falling back to the
+    raw code (uppercased) if we don't have it in our dictionary."""
+    return LANG_NAMES.get(code.lower(), code.upper())
+
+
+# ─── Core Translation Logic (with automatic fallback) ──────────────────────────
+def translate_text(text, src_code, tgt_code):
+    """
+    Translate `text` from src_code to tgt_code.
+
+    Tries Google Translate first (via deep-translator). If that fails for
+    any reason (network hiccup, rate limit, temporary block), it
+    automatically falls back to the MyMemory translation engine so the
+    user almost never sees a hard failure.
+
+    Returns a dict: translated_text, detected_source_name, engine_used, elapsed_ms
+    Raises the last exception only if BOTH engines fail.
+    """
+    start = time.time()
+
+    # ── Attempt 1: Google Translate ──
+    try:
+        translated = GoogleTranslator(source=src_code, target=tgt_code).translate(text)
+
+        if src_code == "auto":
+            try:
+                detected_code = detect_language(text)
+            except Exception:
+                detected_code = "auto"
+        else:
+            detected_code = src_code
+
+        elapsed_ms = round((time.time() - start) * 1000)
+        return {
+            "translated_text": translated,
+            "detected_source_name": get_lang_name(detected_code),
+            "engine_used": "Google",
+            "elapsed_ms": elapsed_ms,
+        }
+
+    except Exception:
+        pass  # fall through to backup engine
+
+    # ── Attempt 2: MyMemory (backup engine, no API key needed) ──
+    # MyMemory doesn't support "auto" as a source — detect locally first.
+    if src_code == "auto":
+        try:
+            mm_source = detect_language(text)
+        except Exception:
+            mm_source = "en"  # safe fallback
+    else:
+        mm_source = src_code
+
+    translated = MyMemoryTranslator(source=mm_source, target=tgt_code).translate(text)
+    elapsed_ms = round((time.time() - start) * 1000)
+
+    return {
+        "translated_text": translated,
+        "detected_source_name": get_lang_name(mm_source),
+        "engine_used": "MyMemory (backup)",
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+translator_ready = True  # kept for symmetry with earlier version; no persistent client needed
 
 # ─── Hero ──────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -259,15 +338,19 @@ if translate_btn:
     else:
         with st.spinner("Translating..."):
             try:
-                start = time.time()
-                result = translator.translate(input_text, src=src_code, dest=tgt_code)
-                elapsed = round((time.time() - start) * 1000)
+                result = translate_text(input_text, src_code, tgt_code)
 
-                translated_text = result.text
-                detected_lang = LANG_NAMES.get(result.src, result.src.upper())
+                translated_text = result["translated_text"]
+                detected_lang = result["detected_source_name"]
+                elapsed = result["elapsed_ms"]
+                engine_used = result["engine_used"]
 
                 st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.markdown('<div class="field-label">📄 Translated Output</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="field-label">📄 Translated Output '
+                    f'<span class="engine-tag">via {engine_used}</span></div>',
+                    unsafe_allow_html=True
+                )
                 st.markdown(f'<div class="output-box">{translated_text}</div>', unsafe_allow_html=True)
 
                 st.markdown(f"""
@@ -289,7 +372,8 @@ if translate_btn:
                 # ─ Text-to-Speech ─
                 with col_b:
                     try:
-                        tts_lang = tgt_code if tgt_code != "auto" else "en"
+                        # gTTS expects short codes like "hi", not "zh-CN" style
+                        tts_lang = tgt_code.split("-")[0] if tgt_code != "auto" else "en"
                         tts = gTTS(text=translated_text, lang=tts_lang, slow=False)
                         audio_buf = io.BytesIO()
                         tts.write_to_fp(audio_buf)
@@ -308,7 +392,8 @@ if translate_btn:
                 st.markdown('<div class="success-banner">✅ Translation completed successfully</div>', unsafe_allow_html=True)
 
             except Exception as e:
-                st.error(f"❌ Translation failed: {str(e)}")
+                st.error(f"❌ Translation failed (both engines unavailable): {str(e)}")
+                st.info("💡 Check your internet connection and try again in a few seconds.")
 
 # ─── Footer ───────────────────────────────────────────────────────────────────
 st.markdown("""
